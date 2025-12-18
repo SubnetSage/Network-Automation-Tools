@@ -2,6 +2,8 @@ import streamlit as st
 import random
 import string
 import ipaddress
+import json
+import pandas as pd
 from io import BytesIO
 import zipfile
 from pyvis.network import Network
@@ -16,51 +18,34 @@ def generate_hostname(router_type, index):
     return f"{router_type}-{letters}{digits}"
 
 def allocate_loopbacks(total_routers, base_network):
-    try:
-        network = ipaddress.IPv4Network(base_network)
-        return [str(ip) for i, ip in enumerate(network.hosts()) if i < total_routers]
-    except ValueError:
-        return [f"10.255.0.{i+1}" for i in range(total_routers)]
+    network = ipaddress.IPv4Network(base_network)
+    return [str(ip) for i, ip in enumerate(network.hosts()) if i < total_routers]
 
 def allocate_p2p_links(num_links, base_network):
-    try:
-        network = ipaddress.IPv4Network(base_network)
-        hosts = list(network.hosts())
-        return [(str(hosts[i]), str(hosts[i + 1])) for i in range(0, num_links * 2, 2)]
-    except (ValueError, IndexError):
-        return [("10.0.0.1", "10.0.0.2")] * num_links
+    network = ipaddress.IPv4Network(base_network)
+    hosts = list(network.hosts())
+    return [(str(hosts[i]), str(hosts[i + 1])) for i in range(0, num_links * 2, 2)]
 
 def create_topology(num_p, num_pe):
-    """
-    P routers = Redundant Core Ring
-    PE routers = Dual-homed (hanging off) to the Core
-    """
     connections = []
-    # Core Ring
     if num_p > 1:
         for i in range(num_p):
             next_p = (i + 1) % num_p
             connections.append((i, next_p))
-    
-    # PE Handoffs
     for i in range(num_pe):
         pe_idx = num_p + i
-        p1 = i % num_p
-        p2 = (i + 1) % num_p
+        p1, p2 = i % num_p, (i + 1) % num_p
         connections.append((p1, pe_idx))
         if num_p > 1:
             connections.append((p2, pe_idx))
     return connections
 
 # ============================================================================
-# 2. VISUAL EXPORT (PYVIS)
+# 2. VISUAL EXPORT (PYVIS) - WITH HOST BIT LABELS
 # ============================================================================
 
 def generate_topology_html(routers, connection_details):
-    """Generates the HTML file with small nodes and long lines"""
-    net = Network(height="800px", width="100%", bgcolor="#ffffff", font_color="black")
-    
-    # Nodes: Small and distinct
+    net = Network(height="700px", width="100%", bgcolor="#ffffff", font_color="black")
     for r in routers:
         is_pe = r['type'] == "PE"
         net.add_node(
@@ -68,75 +53,84 @@ def generate_topology_html(routers, connection_details):
             label=f"{r['hostname']}\n{r['loopback']}", 
             color="#e67e22" if is_pe else "#3498db",
             size=12 if is_pe else 18, 
-            shape="dot" if is_pe else "diamond",
-            font={'size': 10}
+            shape="dot" if is_pe else "diamond"
         )
-        
-    # Edges: With interface labels
     for conn in connection_details:
-        source = routers[conn['source_idx']]['hostname']
-        target = routers[conn['target_idx']]['hostname']
-        
-        # Check if core link for thicker lines
-        is_core = routers[conn['source_idx']]['type'] == 'P' and routers[conn['target_idx']]['type'] == 'P'
+        # Check if keys exist to prevent crash during transition
+        if 'IP A' in conn:
+            host_a = "." + conn['IP A'].split('.')[-1]
+            host_b = "." + conn['IP B'].split('.')[-1]
+            label_text = f"{conn['Port A']} ({host_a}) <---> ({host_b}) {conn['Port B']}"
+        else:
+            label_text = f"{conn.get('Port A', '??')} <---> {conn.get('Port B', '??')}"
         
         net.add_edge(
-            source, target, 
-            label=f"{conn['source_iface']} <-> {conn['target_iface']}",
-            width=3 if is_core else 1,
+            conn['From'], conn['To'], 
+            label=label_text,
             color="#95a5a6",
-            font={'size': 8, 'align': 'top'}
+            font={'size': 9, 'align': 'horizontal', 'color': '#2c3e50'}
         )
-
-    # Physics: Longer lines (Spring Length increased)
     net.set_options("""
-    var options = {
-      "physics": {
-        "barnesHut": {
-          "gravitationalConstant": -4000,
-          "centralGravity": 0.1,
-          "springLength": 380,
-          "springConstant": 0.005,
-          "avoidOverlap": 1
-        }
-      }
-    }
+    var options = { "physics": { "barnesHut": { "gravitationalConstant": -5000, "springLength": 450 } } }
     """)
     return net.generate_html()
 
 # ============================================================================
-# 3. CONFIG GENERATORS
+# 3. FULL STACK CONFIG GENERATOR
 # ============================================================================
 
-def generate_config(r, ifaces, vendor):
-    if vendor == "Cisco":
-        conf = f"hostname {r['hostname']}\n!\ninterface Loopback0\n ip address {r['loopback']} 255.255.255.255\n!\n"
-        for i, ip, m in ifaces:
-            conf += f"interface {i}\n ip address {ip} {m}\n mpls ip\n no shutdown\n!\n"
-    else:
-        conf = f"set system host-name {r['hostname']}\nset interfaces lo0 unit 0 family inet address {r['loopback']}/32\n"
-        for i, ip, m in ifaces:
-            conf += f"set interfaces {i} unit 0 family inet address {ip}/{m}\n"
-    return conf
+def generate_full_stack_config(r, ifaces, p_loopbacks, pe_loopbacks):
+    hostname = r['hostname']
+    lb = r['loopback']
+    asn = "65000"
+    conf = f"! *** FULL STACK + VRF CONFIG FOR {hostname} ***\n"
+    conf += f"hostname {hostname}\n!\n"
+    
+    if r['type'] == 'PE':
+        conf += f"vrf definition CUSTOMER_A\n rd {asn}:{r['index']}\n route-target both {asn}:100\n !\n address-family ipv4\n exit-address-family\n!\n"
+
+    conf += "mpls ip\nmpls label protocol ldp\nmpls ldp router-id Loopback0 force\n!\n"
+    conf += f"interface Loopback0\n ip address {lb} 255.255.255.255\n ip ospf 1 area 0\n!\n"
+    
+    for i, ip, m in ifaces:
+        conf += f"interface {i}\n ip address {ip} {m}\n ip ospf 1 area 0\n mpls ip\n mpls ldp interface\n no shutdown\n!\n"
+    
+    if r['type'] == 'PE':
+        conf += f"interface GigabitEthernet99\n vrf forwarding CUSTOMER_A\n ip address 192.168.{r['index']}.1 255.255.255.0\n no shutdown\n!\n"
+
+    conf += f"router ospf 1\n router-id {lb}\n!\n"
+    conf += f"router bgp {asn}\n bgp router-id {lb}\n"
+    
+    peers = [p for p in (p_loopbacks + pe_loopbacks if r['type'] == 'P' else p_loopbacks) if p != lb]
+    for peer in peers:
+        conf += f" neighbor {peer} remote-as {asn}\n neighbor {peer} update-source Loopback0\n"
+    
+    conf += " address-family vpnv4\n"
+    for peer in peers:
+        conf += f"  neighbor {peer} activate\n  neighbor {peer} send-community both\n"
+        if r['type'] == 'P': conf += f"  neighbor {peer} route-reflector-client\n"
+    conf += " exit-address-family\n"
+    
+    if r['type'] == 'PE':
+        conf += " address-family ipv4 vrf CUSTOMER_A\n  redistribute connected\n exit-address-family\n"
+            
+    return conf + "!\nend\n"
 
 # ============================================================================
 # 4. STREAMLIT UI
 # ============================================================================
 
 def main():
-    st.set_page_config(page_title="MPLS Designer", layout="wide")
-    st.title("🌐 Redundant MPLS Fabric Designer")
+    st.set_page_config(page_title="MPLS Lab Designer", layout="wide")
+    st.title("🌐 The Ultimate MPLS Lab Designer")
 
-    # Sidebar inputs
     with st.sidebar:
-        st.header("Parameters")
-        vendor = st.selectbox("Network Vendor", ["Cisco", "Juniper"])
-        num_p = st.number_input("P Core Nodes", 2, 20, 3)
-        num_pe = st.number_input("PE Edge Nodes", 1, 50, 4)
+        st.header("Lab Parameters")
+        num_p = st.number_input("P Nodes", 2, 10, 3)
+        num_pe = st.number_input("PE Nodes", 2, 20, 4)
         lp_pool = st.text_input("Loopback Pool", "10.255.0.0/24")
         p2p_pool = st.text_input("P2P Pool", "10.0.0.0/24")
-        
-        generate_btn = st.button("🚀 Generate Fabric", type="primary")
+        generate_btn = st.button("🚀 Build Lab", type="primary")
 
     if generate_btn:
         total = num_p + num_pe
@@ -144,61 +138,59 @@ def main():
         topology = create_topology(num_p, num_pe)
         p2p_links = allocate_p2p_links(len(topology), p2p_pool)
         
-        routers = []
+        routers, p_lbs, pe_lbs = [], [], []
         for i in range(num_p):
-            routers.append({'type': 'P', 'hostname': generate_hostname("P", i), 'loopback': loopbacks[i], 'index': i})
+            r = {'type': 'P', 'hostname': generate_hostname("P", i), 'loopback': loopbacks[i], 'index': i}
+            routers.append(r); p_lbs.append(r['loopback'])
         for i in range(num_pe):
-            routers.append({'type': 'PE', 'hostname': generate_hostname("PE", i), 'loopback': loopbacks[num_p+i], 'index': num_p+i})
+            r = {'type': 'PE', 'hostname': generate_hostname("PE", i), 'loopback': loopbacks[num_p+i], 'index': num_p+i}
+            routers.append(r); pe_lbs.append(r['loopback'])
 
         router_interfaces = {i: [] for i in range(total)}
-        iface_counters = {i: 0 for i in range(total)}
         conn_details = []
-
-        iface_prefix = "Gi0/" if vendor == "Cisco" else "ge-0/0/"
-        mask = "255.255.255.254" if vendor == "Cisco" else "31"
+        iface_counters = {i: 0 for i in range(total)}
 
         for idx, (a, b) in enumerate(topology):
             ip_a, ip_b = p2p_links[idx]
-            name_a = f"{iface_prefix}{iface_counters[a]}"
-            name_b = f"{iface_prefix}{iface_counters[b]}"
-            
-            router_interfaces[a].append((name_a, ip_a, mask))
-            router_interfaces[b].append((name_b, ip_b, mask))
+            if_a, if_b = f"Gi0/{iface_counters[a]}", f"Gi0/{iface_counters[b]}"
+            router_interfaces[a].append((if_a, ip_a, "255.255.255.254"))
+            router_interfaces[b].append((if_b, ip_b, "255.255.255.254"))
             
             conn_details.append({
-                'source_idx': a, 'target_idx': b,
-                'source_iface': name_a, 'target_iface': name_b
+                'From': routers[a]['hostname'], 
+                'Port A': if_a, 
+                'IP A': ip_a,
+                'To': routers[b]['hostname'], 
+                'Port B': if_b, 
+                'IP B': ip_b
             })
-            iface_counters[a] += 1
-            iface_counters[b] += 1
+            iface_counters[a] += 1; iface_counters[b] += 1
 
-        configs = {r['hostname']: generate_config(r, router_interfaces[r['index']], vendor) for r in routers}
-        
-        # Save to session
-        st.session_state['configs'] = configs
-        st.session_state['routers'] = routers
-        st.session_state['conn_details'] = conn_details
-        st.success("Fabric Generated!")
+        configs = {r['hostname']: generate_full_stack_config(r, router_interfaces[r['index']], p_lbs, pe_lbs) for r in routers}
+        st.session_state.update({'configs': configs, 'routers': routers, 'conn_details': conn_details, 'ai_context': {"inventory": routers, "topology": conn_details, "configs": configs}})
 
-    # Display section
-    if all(k in st.session_state for k in ['configs', 'routers', 'conn_details']):
-        c1, c2 = st.columns(2)
+    # CRITICAL GUARDRAIL: Check for both existence and correct structure
+    if 'configs' in st.session_state and 'IP A' in st.session_state['conn_details'][0]:
+        c1, c2, c3 = st.columns(3)
         with c1:
-            zip_buf = BytesIO()
-            with zipfile.ZipFile(zip_buf, 'w') as zf:
-                for h, c in st.session_state['configs'].items():
-                    zf.writestr(f"{h}.txt", c)
-            st.download_button("📦 Download Configs (ZIP)", zip_buf.getvalue(), "configs.zip")
-            
+            buf = BytesIO()
+            with zipfile.ZipFile(buf, 'w') as zf:
+                for h, c in st.session_state['configs'].items(): zf.writestr(f"{h}.txt", c)
+            st.download_button("📦 ZIP Configs", buf.getvalue(), "lab_configs.zip")
         with c2:
-            html_map = generate_topology_html(st.session_state['routers'], st.session_state['conn_details'])
-            st.download_button("🌐 Download Diagram (HTML)", html_map, "topology.html", "text/html")
+            html = generate_topology_html(st.session_state['routers'], st.session_state['conn_details'])
+            st.download_button("🌐 Download Diagram (HTML)", html, "topology.html", "text/html")
+        with c3:
+            st.download_button("🤖 AI JSON Context", json.dumps(st.session_state['ai_context'], indent=4), "ai_context.json")
 
+        st.subheader("📋 Detailed Interconnect Table")
+        st.table(pd.DataFrame(st.session_state['conn_details']))
+        
         st.divider()
-        sel = st.selectbox("Preview Router Config", list(st.session_state['configs'].keys()))
+        sel = st.selectbox("Preview Config", list(st.session_state['configs'].keys()))
         st.code(st.session_state['configs'][sel], language="bash")
-    elif "configs" in st.session_state:
-        st.info("Please click 'Generate Fabric' to sync the new diagram data.")
+    elif 'configs' in st.session_state:
+        st.warning("⚠️ Session data updated. Please click '🚀 Build Lab' to refresh interface IP mapping.")
 
 if __name__ == "__main__":
     main()
